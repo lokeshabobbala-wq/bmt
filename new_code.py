@@ -1,887 +1,959 @@
 """
-AWS Lambda Function: SPDST Report Refresh Orchestrator
+AWS Lambda Function: BMT Report Refresh Orchestrator (APJ) - optimized, SonarQube-friendly
 
-This Lambda function manages the SPDST report refresh process by:
-1. Checking prerequisite conditions (Glue jobs status, file availability)
-2. Monitoring data pipeline completion status
-3. Triggering report generation Glue jobs when ready
-4. Handling alerts and status tracking through SNS and RDS audit tables
+This Lambda function manages the APJ/BMT report refresh process by:
+1. Monitoring arrival of priority files and verifying published-layer completion
+2. Validating dependent-region Glue jobs and enforcing start windows (priority-checked vs forced start)
+3. Triggering BMT report generation Glue jobs when conditions are satisfied
+4. Updating RDS audit tables (sc360_reportrefreshtrigger_log, Master_Data_For_IRR) and sending SNS alerts for success/failure/delay
 
 Dependencies:
-- Requires PostgreSQL connections to Redshift and RDS
-- Uses AWS Services: Secrets Manager, Glue, S3, SNS
-- Environment Variables must be properly configured
+- Requires PostgreSQL connections to Redshift and RDS (psycopg2)
+- Uses AWS Services: Secrets Manager, Glue, S3, SNS (boto3)
+- Environment Variables (required/expected): env, reportregion, glue_job, redshift_secret_name, rds_secret_name, sns_arn,
+  cutoff and delay window variables (cutoff_strt_hour/minute, cutoff_end_hour/minute, delay_cutoff_*), 
+  dependent_job1, priority_File_recieved (optional), extraHour, extraMin
 """
+from __future__ import annotations
 
-import os
 import json
+import logging
+import os
+from datetime import date, datetime, timedelta, time as dt_time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
 import boto3
 import psycopg2
-from datetime import datetime, timedelta, date
-import re
-import ast
-import sys
+from botocore.exceptions import BotoCoreError, ClientError
 
-def get_db_connection(secret_name):
-    """
-    Retrieve database credentials from AWS Secrets Manager and establish a connection.
+# Configure logger
+logger = logging.getLogger("bmt_report_refresh_apj")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.propagate = False
+logger.setLevel(logging.INFO)
 
-    Args:
-        secret_name (str): Name of the secret in AWS Secrets Manager.
+# Constants
+DEFAULT_AWS_REGION = "us-east-1"
+S3_PAGE_SIZE = 1000
 
-    Returns:
-        connection: Database connection object.
-    """
-    region_name = "us-east-1"
-    secrets_client = boto3.client('secretsmanager', region_name=region_name)
+
+# -----------------------
+# Utility helpers
+# -----------------------
+def _aws_region() -> str:
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or DEFAULT_AWS_REGION
+
+
+def _parse_secret(secret_string: Optional[str]) -> Dict[str, Any]:
+    try:
+        if not secret_string:
+            return {}
+        try:
+            return json.loads(secret_string)
+        except Exception:
+            import ast
+            parsed = ast.literal_eval(secret_string)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        logger.exception("Error parsing secret string")
+        raise
+
+
+def _ensure_date_str_from_db(value: Any, fallback: Optional[str] = None) -> str:
+    try:
+        if fallback is None:
+            fallback = date.today().isoformat()
+        if value is None:
+            return fallback
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+                return parsed.date().isoformat()
+            except Exception:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    parsed = datetime.strptime(value, fmt)
+                    return parsed.date().isoformat()
+                except Exception:
+                    continue
+        logger.warning("Unable to coerce DB value to date string: %r. Using fallback %s", value, fallback)
+        return fallback
+    except Exception as exc:
+        logger.exception("_ensure_date_str_from_db error: %s", exc)
+        return fallback or date.today().isoformat()
+
+
+def get_db_connection(secret_name: str, region_name: Optional[str] = None):
+    try:
+        region = region_name or _aws_region()
+        client = boto3.client("secretsmanager", region_name=region)
+        resp = client.get_secret_value(SecretId=secret_name)
+        secret_string = resp.get("SecretString", "")
+        creds = _parse_secret(secret_string)
+
+        dbname = creds.get("redshift_database") or creds.get("engine") or creds.get("dbname")
+        port = int(creds.get("redshift_port") or creds.get("port") or 5439)
+        user = creds.get("redshift_username") or creds.get("username")
+        password = creds.get("redshift_password") or creds.get("password")
+        host = creds.get("redshift_host") or creds.get("host")
+
+        if not all([dbname, port, user, password, host]):
+            raise KeyError("Missing DB credential fields in secret")
+
+        conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host, port=port)
+        conn.autocommit = False
+        logger.info("DB connection established for secret: %s", secret_name)
+        return conn
+    except (ClientError, BotoCoreError) as exc:
+        logger.exception("Secrets Manager error retrieving %s: %s", secret_name, exc)
+        raise RuntimeError("Failed to fetch DB secret") from exc
+    except Exception:
+        logger.exception("Failed to create DB connection for secret: %s", secret_name)
+        raise
+
+
+def publish_sns(sns_client, sns_arn: str, subject: str, message: Dict[str, Any]) -> None:
+    try:
+        resp = sns_client.publish(TargetArn=sns_arn, Subject=subject, Message=json.dumps(message))
+        logger.info("SNS published: subject=%s messageId=%s", subject, resp.get("MessageId"))
+    except (ClientError, BotoCoreError) as exc:
+        logger.exception("Failed to publish SNS subject=%s: %s", subject, exc)
+
+
+def list_s3_files(s3_client, bucket: str, prefix: str) -> List[str]:
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        names: List[str] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": S3_PAGE_SIZE}):
+            for obj in page.get("Contents", []) if page else []:
+                key = obj.get("Key", "")
+                fname = key.rsplit("/", 1)[-1]
+                if fname and not fname.startswith("SC360metadata_"):
+                    names.append(fname)
+        return names
+    except Exception:
+        logger.exception("Error listing S3 files for %s/%s", bucket, prefix)
+        raise
+
+
+# -----------------------
+# Legacy rundate/refreshlogdate helper
+# -----------------------
+def determine_rundates(
+    rds_cursor,
+    reportregion: str,
+    current_time: datetime,
+    default_batch_run_date: date,
+) -> Tuple[Optional[date], date, date, int, Optional[datetime], Optional[datetime], Optional[date], Optional[date]]:
+    E_count = 0
+    logBatchrundt = None
+    logtimestamp = None
+    lastrefreshactualtime = None
+    Batchrundt = None
 
     try:
-        response = secrets_client.get_secret_value(SecretId=secret_name)
-        
-        if response['ResponseMetadata']['HTTPStatusCode'] == 200:
-            print(f"Successfully retrieved credentials for {secret_name}")
-            creds = ast.literal_eval(response['SecretString'])
+        rds_cursor.execute(
+            """
+            SELECT count(a.*) FROM (
+                SELECT CASE WHEN count(*) = 0 THEN TIMESTAMP '1900-12-31 00:00:00' ELSE max(actual_start_time) END as actual_start_time
+                FROM audit.sc360_reportrefreshtrigger_log
+                WHERE regionname = %s
+                  AND report_source = 'BMT'
+                  AND execution_status IN ('Finished','Submitted')
+            ) a
+            INNER JOIN (
+                SELECT max(logtimestamp) as logtimestamp
+                FROM audit.vw_backlog_priority_file_load_Status
+                WHERE regionname = %s
+            ) b ON a.actual_start_time < b.logtimestamp;
+            """,
+            (reportregion, reportregion),
+        )
+        row = rds_cursor.fetchone()
+        E_count = int(row[0] or 0) if row else 0
+    except Exception:
+        logger.exception("Error computing E_count; defaulting to 0")
+        E_count = 0
 
-            dbname = creds.get("redshift_database") or creds.get("engine")  # Handle Redshift & RDS
-            port = creds.get("redshift_port") or creds.get("port")
-            username = creds.get("redshift_username") or creds.get("username")
-            password = creds.get("redshift_password") or creds.get("password")
-            host = creds.get("redshift_host") or creds.get("host")
+    try:
+        rds_cursor.execute(
+            "SELECT to_date(to_char(max(logtimestamp), 'YYYY-MM-DD'), 'YYYY-MM-DD') FROM audit.vw_backlog_priority_file_load_Status WHERE regionname = %s;",
+            (reportregion,),
+        )
+        row = rds_cursor.fetchone()
+        logBatchrundt = row[0] if row and row[0] is not None else None
+    except Exception:
+        logger.exception("Error fetching logBatchrundt")
+        logBatchrundt = None
 
-            if not all([dbname, port, username, password, host]):
-                raise KeyError(f"Missing required database credentials in {secret_name}")
+    try:
+        rds_cursor.execute(
+            "SELECT max(logtimestamp) FROM audit.vw_backlog_priority_file_load_Status WHERE regionname = %s;",
+            (reportregion,),
+        )
+        row = rds_cursor.fetchone()
+        logtimestamp = row[0] if row and row[0] is not None else None
+    except Exception:
+        logger.exception("Error fetching logtimestamp")
+        logtimestamp = None
 
-            conn_string = f"dbname='{dbname}' port='{port}' user='{username}' password='{password}' host='{host}'"
-            connection = psycopg2.connect(conn_string)
-            print("Connection Successful")
-            return connection
+    try:
+        rds_cursor.execute(
+            "SELECT max(actual_start_time) FROM audit.sc360_reportrefreshtrigger_log WHERE report_source = 'BMT' AND execution_status IN ('Finished','Submitted') AND regionname = %s;",
+            (reportregion,),
+        )
+        row = rds_cursor.fetchone()
+        lastrefreshactualtime = row[0] if row and row[0] is not None else None
+    except Exception:
+        logger.exception("Error fetching lastrefreshactualtime")
+        lastrefreshactualtime = None
 
+    try:
+        rds_cursor.execute(
+            "SELECT max(batchrundate) FROM audit.vw_backlog_priority_file_load_Status WHERE regionname = %s;",
+            (reportregion,),
+        )
+        row = rds_cursor.fetchone()
+        Batchrundt = row[0] if row and row[0] is not None else None
+    except Exception:
+        logger.exception("Error fetching Batchrundt")
+        Batchrundt = None
+
+    if logBatchrundt is not None and Batchrundt is not None and logBatchrundt == Batchrundt:
+        rundate = logBatchrundt
+    else:
+        rundate = Batchrundt or logBatchrundt or default_batch_run_date
+
+    try:
+        if 21 <= current_time.hour <= 23:
+            refreshlogdate = default_batch_run_date + timedelta(days=1)
         else:
-            print(f"Failed to retrieve credentials for {secret_name}")
-            sys.exit(f"Failed to retrieve credentials for {secret_name}")
-    except Exception as e:
-        print(f"Error getting DB connection: {e}")
-        raise
+            refreshlogdate = default_batch_run_date
+    except Exception:
+        refreshlogdate = default_batch_run_date
 
-def send_sns_message(sns_client, sns_arn, subject, message):
-    """
-    Send a message to an SNS topic.
+    normalized_batch_run_date = rundate if isinstance(rundate, date) else default_batch_run_date
 
-    Args:
-        sns_client: Boto3 SNS client.
-        sns_arn (str): SNS topic ARN.
-        subject (str): Subject of the SNS message.
-        message (dict): Message body.
-    """
+    return rundate, refreshlogdate, normalized_batch_run_date, E_count, logtimestamp, lastrefreshactualtime, logBatchrundt, Batchrundt
+
+
+# -----------------------
+# New helper: legacy refreshlogdate checks and insert
+# -----------------------
+def handle_legacy_refreshlogdate_flow(
+    rds_cursor,
+    rds_conn,
+    reportregion: str,
+    refreshlogdate: date,
+    E_count: int,
+    logtimestamp: Optional[datetime],
+    lastrefreshactualtime: Optional[datetime],
+    glue_job: str,
+    join_start: datetime,
+    join_end: datetime,
+) -> Tuple[bool, str]:
     try:
-        response = sns_client.publish(TargetArn=sns_arn, Message=json.dumps(message), Subject=subject)
-
-        # Print success message with MessageId
-        print(f"SNS Message Published Successfully! Message ID: {response['MessageId']}, {subject}")
-    except Exception as e:
-        print(f"Error sending SNS message: {e}")
-        raise
-
-def check_s3_files(s3_client, bucket, folder):
-    """
-    Check for files in a specified S3 bucket and folder.
-
-    Args:
-        s3_client: Boto3 S3 client.
-        bucket (str): S3 bucket name.
-        folder (str): S3 folder path.
-
-    Returns:
-        list: List of files in the specified S3 folder.
-    """
-    try:
-        all_objects = s3_client.list_objects_v2(Bucket=bucket, Prefix=folder, MaxKeys=350)
-        return [obj['Key'].split('/')[-1].split('.')[0][:-15] for obj in all_objects.get('Contents', []) if not obj['Key'].startswith('SC360metadata_')]
-    except Exception as e:
-        print(f"Error checking S3 files: {e}")
-        raise
-
-def verify_file_existence(s3_client, env, reportregion, batch_run_date, pfile):
-    """
-    Verify if a specific file exists in S3 LandingZone or ArchiveZone.
-
-    Args:
-        s3_client: Boto3 S3 client.
-        env (str): Deployment environment.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Date for dt= partition.
-        pfile (str): Filename to search for.
-
-    Returns:
-        bool: True if file exists, False otherwise.
-    """
-    try:
-        landing_bucket = f'sc360-{env}-{reportregion.lower()}-bucket'
-        landing_folder = f'LandingZone/dt={batch_run_date}/'
-        archive_folder = f'ArchiveZone/dt={batch_run_date}/'
-
-        landing_files = check_s3_files(s3_client, landing_bucket, landing_folder)
-        archive_files = check_s3_files(s3_client, landing_bucket, archive_folder)
-
-        if pfile in landing_files or pfile in archive_files:
-            return True
-        return False
-    except Exception as e:
-        print(f"Error verifying file existence: {e}")
-        raise
-
-def check_glue_jobs(glue_client, dependent_jobs):
-    """
-    Check if any dependent Glue jobs are currently running.
-
-    Args:
-        glue_client: Boto3 Glue client.
-        dependent_jobs (list): List of Glue job names to check.
-
-    Returns:
-        bool: True if all jobs are stopped, False if any are running.
-    """
-    try:
-        for job in dependent_jobs:
-            response = glue_client.get_job_runs(JobName=job)
-            status = response['JobRuns'][0]['JobRunState']
-            print(f"Execution status of {job}: {status}")
-            if status in ['STARTING', 'RUNNING', 'STOPPING']:
-                return False
-        return True
-    except Exception as e:
-        print(f"Error checking Glue jobs: {e}")
-        raise
-
-def fetch_execution_time_window(rds_cursor, reportregion):
-    """
-    Calculate the expected execution time window.
-
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-
-    Returns:
-        tuple: Start time, end time, and batch run date.
-    """
-    try:
-        batch_run_date = datetime.today().date()
         rds_cursor.execute(
-            """SELECT Expected_Start_time 
-            FROM audit.Master_Data_For_Report_Refresh 
-            WHERE regionname = %s 
-            AND report_source LIKE %s;""",
-            (reportregion, '%SPDST%')
+            "SELECT count(1) FROM audit.sc360_reportrefreshtrigger_log WHERE regionname = %s AND batchrundate = %s AND report_source = 'BMT' AND execution_status IN ('Finished','Submitted');",
+            (reportregion, refreshlogdate),
         )
+        refreshdate_count = int(rds_cursor.fetchone()[0] or 0)
+    except Exception:
+        logger.exception("Error fetching refreshdate_count; assuming 0")
+        refreshdate_count = 0
 
-        expectedstart = rds_cursor.fetchall()[0][0]
-        print(f"Checking expectedstart  {expectedstart}")
-        
-        rds_cursor.execute(
-            """SELECT Average_runtime 
-            FROM audit.Master_Data_For_Report_Refresh 
-            WHERE regionname = %s 
-            AND report_source LIKE %s;""",
-            (reportregion, '%SPDST%')
-        )
-        averagerun = rds_cursor.fetchall()[0][0]
-        
-        final_time = datetime.strptime(str(expectedstart), '%H:%M:%S') + timedelta(minutes=averagerun)
-        end_time = str(final_time)[11:]
-        join_start = datetime.strptime(f"{batch_run_date} {expectedstart}", "%Y-%m-%d %H:%M:%S")
-        join_end = datetime.strptime(f"{batch_run_date} {end_time}", "%Y-%m-%d %H:%M:%S")
-        print(f"Checking expectedstart  {join_start}")
-        return join_start, join_end
-    except Exception as e:
-        print(f"Error fetching execution time window: {e}")
-        raise
+    if E_count == 0 and refreshdate_count > 0:
+        if lastrefreshactualtime is not None and logtimestamp is not None:
+            if lastrefreshactualtime > logtimestamp:
+                reason = f"Report refresh already triggered for refreshlogdate={refreshlogdate}; lastrefreshactualtime ({lastrefreshactualtime}) > logtimestamp ({logtimestamp})"
+                logger.info(reason)
+                return True, reason
+        else:
+            reason = f"Report refresh already triggered for refreshlogdate={refreshlogdate}; refreshdate_count={refreshdate_count} and E_count==0 but timestamps missing"
+            logger.info(reason)
+            return True, reason
 
-def check_existing_execution_status(rds_cursor, reportregion, batch_run_date):
-    """
-    Check existing execution status and return relevant information.
-
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-
-    Returns:
-        tuple: Execution exists (bool), execution status (str or None).
-    """
-    try:
-        print(f"Checking existing execution status for {batch_run_date}")
-        rds_cursor.execute(
-            "SELECT COUNT(*) FROM audit.sc360_reportrefreshtrigger_log WHERE regionname=%s AND batchrundate=%s AND report_source=%s;",
-            (reportregion, batch_run_date, 'SPDST')
-        )
-        existing_entries = rds_cursor.fetchall()
-
-        if existing_entries[0][0] > 0:
+    if E_count > 0 and (refreshdate_count == 0 or (lastrefreshactualtime is not None and logtimestamp is not None and lastrefreshactualtime < logtimestamp)):
+        try:
             rds_cursor.execute(
-                """SELECT execution_status 
-                FROM audit.sc360_reportrefreshtrigger_log 
-                WHERE regionname = %s 
-                AND batchrundate = %s 
-                AND report_source = %s;""",
-                (reportregion, batch_run_date, 'SPDST')
+                "SELECT count(*) FROM audit.sc360_reportrefreshtrigger_log WHERE regionname = %s AND batchrundate = %s AND report_source = 'BMT';",
+                (reportregion, refreshlogdate),
             )
-            execution_status = rds_cursor.fetchall()[0][0]
-            print(f"Execution exists: True, Status: {execution_status}")
-            return True, execution_status
-        print(f"Execution exists: False, Status: None")
-        return False, None
-    except Exception as e:
-        print(f"Error checking existing execution status: {e}")
-        raise
+            cnt_any = int(rds_cursor.fetchone()[0] or 0)
+        except Exception:
+            logger.exception("Error checking existing trigger rows for refreshlogdate; assuming 0")
+            cnt_any = 0
 
-def handle_duplicate_execution(glue_client, rds_cursor, rds_connection, reportregion, batch_run_date, execution_status, current_time, join_start):
+        if cnt_any == 0:
+            logger.info("Legacy check: inserting initial trigger row for refreshlogdate=%s (E_count=%s, logtimestamp=%s, lastrefreshactualtime=%s)", refreshlogdate, E_count, logtimestamp, lastrefreshactualtime)
+            create_initial_log_entry(rds_cursor, rds_conn, refreshlogdate, reportregion, glue_job, join_start, join_end)
+            reason = f"Inserted initial trigger row for refreshlogdate={refreshlogdate} because backlog indicated new work (E_count={E_count})"
+            logger.info(reason)
+            return False, reason
+        else:
+            reason = f"Trigger row already exists for refreshlogdate={refreshlogdate} (count={cnt_any})"
+            logger.info(reason)
+            return False, reason
+
+    return False, "No legacy refreshlogdate action required"
+
+
+# -----------------------
+# New helper: select trigger row date (centralized)
+# -----------------------
+def select_trigger_row_date(rds_cursor, reportregion: str, refreshlogdate: date, batch_run_date: date) -> Tuple[date, bool, Optional[str]]:
     """
-    Handle duplicate execution cases.
-
-    Args:
-        glue_client: Boto3 Glue client.
-        rds_cursor: RDS database cursor.
-        rds_connection: RDS database connection.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        execution_status (str): Current execution status.
-        current_time (datetime): Current time.
-        join_start (datetime): Expected start time.
-
-    Returns:
-        bool: True if duplicate execution is handled, False otherwise.
+    Decide which trigger-row date to use for audit updates and early-exit.
+    - Prefer refreshlogdate if a trigger-log row exists for it.
+    - Otherwise fall back to batch_run_date.
+    Returns (trigger_row_date, exists, execution_status_or_None)
     """
     try:
-        if execution_status in ('Finished', 'Submitted'):
-            print(f"Report Refresh already triggered for {batch_run_date}")
-            return True
+        rds_cursor.execute(
+            "SELECT execution_status FROM audit.sc360_reportrefreshtrigger_log WHERE regionname=%s AND batchrundate=%s AND report_source=%s LIMIT 1;",
+            (reportregion, refreshlogdate, "BMT"),
+        )
+        row = rds_cursor.fetchone()
+        if row:
+            return refreshlogdate, True, row[0]
+        # fallback to normalized batch_run_date
+        rds_cursor.execute(
+            "SELECT execution_status FROM audit.sc360_reportrefreshtrigger_log WHERE regionname=%s AND batchrundate=%s AND report_source=%s LIMIT 1;",
+            (reportregion, batch_run_date, "BMT"),
+        )
+        row2 = rds_cursor.fetchone()
+        if row2:
+            return batch_run_date, True, row2[0]
+        return batch_run_date, False, None
+    except Exception:
+        logger.exception("select_trigger_row_date failed; defaulting to batch_run_date without existing row")
+        return batch_run_date, False, None
 
-        dependent_jobs = [
-            os.environ['dependent_job1']
-        ]
-        
-        if not check_glue_jobs(glue_client, dependent_jobs):
-            print("Dependent jobs still running")
+
+# -----------------------
+# Glue helpers (dependent_glue_jobs_running, handle_dependent_jobs_check, ...)
+# -----------------------
+def dependent_glue_jobs_running(glue_client, jobs: Iterable[str]) -> bool:
+    try:
+        for job in jobs:
+            if not job:
+                continue
+            resp = glue_client.get_job_runs(JobName=job, MaxResults=1)
+            runs = resp.get("JobRuns") or []
+            if not runs:
+                logger.debug("No job runs for %s", job)
+                continue
+            state = runs[0].get("JobRunState")
+            logger.info("Dependent job %s state=%s", job, state)
+            if state in ("STARTING", "RUNNING", "STOPPING"):
+                return True
+        return False
+    except Exception:
+        logger.exception("Error checking dependent glue jobs")
+        return True
+
+
+def handle_dependent_jobs_check(
+    glue_client,
+    rds_cursor,
+    rds_conn,
+    dependent_jobs: Sequence[str],
+    current_time: datetime,
+    join_start: datetime,
+    batch_run_date: date,
+    reportregion: str,
+) -> bool:
+    try:
+        if dependent_glue_jobs_running(glue_client, dependent_jobs):
             if current_time > join_start:
                 rds_cursor.execute(
-                    """UPDATE audit.sc360_reportrefreshtrigger_log 
-                    SET execution_status = %s, error_message = %s 
-                    WHERE batchrundate = %s 
-                    AND regionname = %s 
-                    AND report_source = %s;""",
-                    ('Delay', 'Other Region Report Refresh is already running', batch_run_date, reportregion, 'SPDST')
+                    "UPDATE audit.sc360_reportrefreshtrigger_log SET execution_status=%s, error_message=%s WHERE batchrundate=%s AND regionname=%s AND report_source='BMT';",
+                    ("Delay", "Other Region Report Refresh is already running", batch_run_date, reportregion),
                 )
-            rds_connection.commit()
+                rds_conn.commit()
+            logger.info("Dependent region jobs running; exiting.")
             return True
         return False
-    except Exception as e:
-        print(f"Error handling duplicate execution: {e}")
-        raise
+    except Exception:
+        logger.exception("handle_dependent_jobs_check failed")
+        try:
+            rds_cursor.execute(
+                "UPDATE audit.sc360_reportrefreshtrigger_log SET execution_status=%s, error_message=%s WHERE batchrundate=%s AND regionname=%s AND report_source='BMT';",
+                ("Delay", "Error checking dependent jobs", batch_run_date, reportregion),
+            )
+            rds_conn.commit()
+        except Exception:
+            logger.exception("Failed to update audit when dependent job check failed")
+        return True
 
-def retrieve_priority_files(rds_cursor, reportregion):
-    """
-    Retrieve priority files list.
 
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-
-    Returns:
-        list: List of priority files.
-    """
+# -----------------------
+# Remaining helpers (compute_join_start_end_for_bmt, update_master_data_for_irr, priority file pipeline, actions...)
+# -----------------------
+def compute_join_start_end_for_bmt(rds_cursor, reportregion: str) -> Tuple[datetime, datetime, date]:
     try:
-        print("Fetching priority files...")
         rds_cursor.execute(
-            """SELECT filename 
-            FROM audit.fileproperty_check_new 
-            WHERE priorityflag = %s 
-            AND region = %s 
-            AND data_source NOT LIKE %s;""",
-            ('YES', reportregion, 'BMT%')
+            "SELECT Expected_Start_time FROM audit.Master_Data_For_Report_Refresh WHERE regionname = %s AND report_source LIKE %s;",
+            (reportregion, "%BMT%"),
         )
-        priority_files = [row[0] for row in rds_cursor.fetchall()]
-        print(f"Priority files retrieved: {priority_files}")
-        return priority_files
-    except Exception as e:
-        print(f"Error retrieving priority files: {e}")
+        row = rds_cursor.fetchone()
+        if not row:
+            raise RuntimeError(f"Expected_Start_time missing for region {reportregion}")
+        expected_time = row[0]
+
+        rds_cursor.execute(
+            "SELECT Average_runtime FROM audit.Master_Data_For_Report_Refresh WHERE regionname = %s AND report_source LIKE %s;",
+            (reportregion, "%BMT%"),
+        )
+        avg_row = rds_cursor.fetchone()
+        avg_minutes = int(avg_row[0]) if avg_row and avg_row[0] is not None else 0
+
+        batch_run_date = date.today()
+        if hasattr(expected_time, "hour"):
+            start_dt = datetime.combine(batch_run_date, expected_time)
+        else:
+            start_dt = datetime.strptime(f"{batch_run_date} {expected_time}", "%Y-%m-%d %H:%M:%S")
+        end_dt = start_dt + timedelta(minutes=avg_minutes)
+        return start_dt, end_dt, batch_run_date
+    except Exception:
+        logger.exception("compute_join_start_end_for_bmt failed")
         raise
 
-def check_loaded_curated_files(rds_cursor, reportregion, batch_run_date, priority_files):
-    """
-    Check loaded files in the curated layer.
 
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-
-    Returns:
-        list: List of loaded curated files.
-    """
+def update_master_data_for_irr(rds_cursor, rds_conn, reportregion: str) -> None:
     try:
-        print("Checking loaded curated files...")
-        placeholders = ', '.join(['%s'] * len(priority_files))
-        query = f"""
-            SELECT DISTINCT filename 
-            FROM audit.sc360_audit_log 
-            WHERE batchrundate = %s 
-            AND regionname = %s 
-            AND processname = %s 
-            AND executionstatus = %s 
-            AND filename IN ({placeholders});
-        """
-        # Execute with dynamic file list
-        rds_cursor.execute(query, (batch_run_date, reportregion, 'RedshiftCuratedLoad', 'Succeeded', *priority_files))
-        loadedcuratedfiles = [row[0] for row in rds_cursor.fetchall()]
-        print(f"Loaded curated files: {loadedcuratedfiles}")
-        return loadedcuratedfiles
-    except Exception as e:
-        print(f"Error checking loaded curated files: {e}")
-        raise
-
-def map_files_to_stored_procedures(rds_cursor, reportregion, loadedcuratedfiles):
-    """
-    Map files to stored procedures.
-
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-        loadedcuratedfiles (list): List of loaded curated files.
-
-    Returns:
-        list: List of tuples containing loaded files and their corresponding stored procedures.
-    """
-    try:
-        print("Mapping files to stored procedures...")
-        procs_list = []
-        for loadedfile in loadedcuratedfiles:
-            rds_cursor.execute(
-                """SELECT DISTINCT stored_procedure_name 
-                FROM audit.sps_batch_master_table_updated 
-                WHERE regionname = %s 
-                AND source_filename LIKE %s;""",
-                (reportregion, f"%{loadedfile}%")
-            )
-            file_stored_procs = rds_cursor.fetchall()
-            if file_stored_procs:
-                procs_list.append([loadedfile, file_stored_procs[0][0]])
-        print(f"Procedure List:{procs_list}")
-        return procs_list
-    except Exception as e:
-        print(f"Error mapping files to stored procedures: {e}")
-        raise
-
-def verify_published_layer_completion(rds_cursor, reportregion, batch_run_date, procs_list):
-    """
-    Verify published layer completion.
-
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        procs_list (list): List of tuples containing loaded files and their corresponding stored procedures.
-
-    Returns:
-        list: List of final files that have completed published layer processing.
-    """
-    try:
-        print("Verifying published layer completion...")
-        final_files = []
-        for procs in procs_list:
-            # Adjust stored procedure name if it does not end with '();'
-            if not re.findall(r" \(\);$", procs[1]):
-                procs[1] = procs[1].replace("('", "(''").replace("')", "'')").replace("''", "'")
-
-            # Query to check if the process has succeeded
-            rds_cursor.execute(
-                """SELECT COUNT(*) FROM audit.sc360_audit_log 
-                WHERE batchrundate = %s 
-                AND regionname = %s 
-                AND processname = %s 
-                AND executionstatus = %s 
-                AND scriptpath = %s;""",
-                (batch_run_date, reportregion, 'RedshiftPublishedLoad', 'Succeeded', procs[1])
-            )
-            final_load_files_list = rds_cursor.fetchall()
-
-            # Append to final_files if the process succeeded
-            if final_load_files_list[0][0] > 0:
-                final_files.append(procs[0])
-
-        print(f"Final files after published layer check: {final_files}")
-        return final_files
-    except Exception as e:
-        print(f"Error verifying published layer completion: {e}")
-        raise
-
-def handle_priority_files(s3_client, env, reportregion, rds_cursor, rds_connection, batch_run_date, priority_files, final_files):
-    """
-    Handle priority files and update status.
-
-    Args:
-        s3_client: Boto3 S3 client.
-        env (str): Deployment environment.
-        reportregion (str): Report region name.
-        rds_cursor: RDS database cursor.
-        rds_connection: RDS database connection.
-        batch_run_date (datetime.date): Batch run date.
-        priority_files (list): List of priority files.
-        final_files (list): List of final files that have completed published layer processing.
-
-    Returns:
-        tuple: Lists of files not received, failed files, and the count of processed files.
-    """
-    try:
-        print("Handling priority files processing...")
-
-        filesnotreceived = []
-        filesfailed = []
-        pfcount = 0
-        for pfile in priority_files:
-            if pfile in final_files:
-                # Check S3 for missing files
-                filereceivedflag = verify_file_existence(s3_client, env, reportregion, batch_run_date, pfile)
-                print(f"File Received Flag for {pfile}: {filereceivedflag}")
-
-                if filereceivedflag:
-                    print(f"{pfile} is loaded into s3.")
-                else:
-                    print(f"{pfile} has not loaded into s3.")
-                
-                # Check for failed processes
+        rds_cursor.execute(
+            "SELECT report_name, report_refresh_frequency, expected_start_time, average_runtime, status, date(actual_start_time) "
+            "FROM audit.Master_Data_For_IRR WHERE regionname = %s;",
+            (reportregion,),
+        )
+        rows = rds_cursor.fetchall()
+        today_str = date.today().isoformat()
+        for report_name, frequency, expect_time, averagerun, status, actual_start in rows:
+            averagerun = int(averagerun or 0)
+            expect_time_str = str(expect_time)
+            expect_dt_base = datetime.strptime(f"{date.today()} {expect_time_str}", "%Y-%m-%d %H:%M:%S")
+            if frequency in ("Monthly", "Quarterly", "Weekly", "Yearly"):
                 rds_cursor.execute(
-                    """SELECT DISTINCT processname FROM audit.sc360_audit_log 
-                    WHERE batchrundate = %s 
-                    AND executionstatus = %s 
-                    AND filename = %s;""",
-                    (batch_run_date, 'Failed', pfile)
+                    "SELECT File_arrival_cutoff_datetime FROM audit.Master_Data_For_IRR WHERE report_name = %s AND regionname = %s;",
+                    (report_name, reportregion),
                 )
-                failedprocesses = rds_cursor.fetchall()
-
-                if not failedprocesses and not filereceivedflag:
-                    filesnotreceived.append(pfile)
-                    print(f"Files not received: {filesnotreceived}, Failed files: {filesfailed}")
-                else:
-                    pfcount += 1  # File is either received or failed processes exist
-                    print(f"Processed Files received: {pfcount}")
+                cutoff_row = rds_cursor.fetchone()
+                cutoff_date_str = _ensure_date_str_from_db(cutoff_row[0] if cutoff_row else None, fallback=today_str)
+                expect_sdt = datetime.strptime(f"{cutoff_date_str} {expect_time_str}", "%Y-%m-%d %H:%M:%S")
+                join_end_dt = expect_sdt + timedelta(minutes=averagerun)
             else:
-                filesnotreceived.append(pfile)
-                print(f"{pfile} has not been loaded into published layer: {final_files}")
-        return filesnotreceived, filesfailed, pfcount
-    except Exception as e:
-        print(f"Error handling priority files: {e}")
-        raise
+                expect_sdt = expect_dt_base
+                join_end_dt = expect_sdt + timedelta(minutes=averagerun)
 
-def determine_time_period_status(current_time, cutoff_strt_hour, cutoff_strt_min, cutoff_end_hour, cutoff_end_min):
-    """
-    Determine the current time period status.
-
-    Args:
-        current_time (datetime): Current time.
-        cutoff_strt_hour (int): Cutoff start hour.
-        cutoff_strt_min (int): Cutoff start minute.
-        cutoff_end_hour (int): Cutoff end hour.
-        cutoff_end_min (int): Cutoff end minute.
-
-    Returns:
-        str: 'YES' if current time is within the cutoff period, 'NO' otherwise.
-    """
-    try:
-        snstimeperiod = 'YES' if (
-            (current_time.hour > cutoff_strt_hour or 
-             (current_time.hour == cutoff_strt_hour and current_time.minute >= cutoff_strt_min)) and 
-            (current_time.hour < cutoff_end_hour or 
-             (current_time.hour == cutoff_end_hour and current_time.minute <= cutoff_end_min))
-        ) else 'NO'
-        return snstimeperiod
-    except Exception as e:
-        print(f"Error determining time period status: {e}")
-        raise
-
-def check_bmt_report_completion(rds_cursor, reportregion, batch_run_date, rds_connection, current_time, join_start):
-    """
-    Check BMT report completion.
-
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        join_start (datetime): Expected start time.
-        rds_connection: RDS database connection.
-        current_time (datetime): Current time.
-
-    Returns:
-        int: 1 if BMT report is completed, 0 otherwise.
-    """
-    try:
-        print(f"Checking BMT report completion status for the date {batch_run_date}...")
-        rds_cursor.execute(
-            """SELECT COUNT(*) 
-            FROM audit.sc360_reportrefreshtrigger_log 
-            WHERE regionname = %s 
-            AND batchrundate = %s 
-            AND report_source = %s 
-            AND execution_Status = %s;""",
-            (reportregion, batch_run_date, 'BMT', 'Finished')
-        )
-
-        BMTRefreshcount = rds_cursor.fetchall()
-        BMTFlag = 1 if BMTRefreshcount[0][0] > 0 else 0
-        if BMTFlag == 0 and current_time > join_start:
-            print("BMT Report Refresh not Triggered/Finished for the day")
             rds_cursor.execute(
-                """UPDATE audit.sc360_reportrefreshtrigger_log 
-                SET execution_status = %s, error_message = %s 
-                WHERE batchrundate = %s 
-                AND regionname = %s 
-                AND report_source = %s;""",
-                ('Delay', 'BMT Report Refresh not Triggered/Finished for the day', batch_run_date, reportregion, 'SPDST')
+                "UPDATE audit.Master_Data_For_IRR SET expected_start=%s, expected_end=%s WHERE report_name=%s AND regionname=%s;",
+                (expect_sdt, join_end_dt, report_name, reportregion),
             )
-            rds_connection.commit()
-        return BMTFlag
-    except Exception as e:
-        print(f"Error checking BMT report completion: {e}")
+            rds_conn.commit()
+
+            current_time = datetime.now()
+            new_status = "Null"
+            expect_start_date = expect_sdt.date() if expect_sdt else None
+
+            actual_start_date = None
+            if actual_start:
+                actual_start_iso = _ensure_date_str_from_db(actual_start, fallback=None)
+                try:
+                    actual_start_date = datetime.fromisoformat(actual_start_iso).date()
+                except Exception:
+                    try:
+                        actual_start_date = datetime.strptime(actual_start_iso, "%Y-%m-%d").date()
+                    except Exception:
+                        logger.warning("Could not parse actual_start for report %s: %r", report_name, actual_start)
+                        actual_start_date = None
+
+            if actual_start_date:
+                if actual_start_date == expect_start_date:
+                    if current_time <= expect_sdt and (status is None or status == "Null"):
+                        new_status = "Yet to start"
+                    elif current_time <= expect_sdt and status == "Completed":
+                        new_status = "Completed"
+                    elif current_time >= expect_sdt and status != "Completed":
+                        new_status = "Delay"
+                    elif current_time >= expect_sdt and status == "Completed":
+                        new_status = "Completed"
+                else:
+                    new_status = "Null"
+            else:
+                new_status = "Null"
+
+            rds_cursor.execute(
+                "UPDATE audit.Master_Data_For_IRR SET status=%s WHERE report_name=%s AND regionname=%s;",
+                (new_status, report_name, reportregion),
+            )
+            rds_conn.commit()
+            logger.info("IRR updated for %s: status=%s", report_name, new_status)
+    except Exception:
+        logger.exception("update_master_data_for_irr failed")
         raise
 
-def trigger_glue_job(glue_client, rds_cursor, rds_connection, reportregion, batch_run_date, glue_job):
-    """
-    Trigger Glue job and update status.
 
-    Args:
-        glue_client: Boto3 Glue client.
-        rds_cursor: RDS database cursor.
-        rds_connection: RDS database connection.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        glue_job (str): Glue job name.
-    """
+def fetch_priority_files(rds_cursor, reportregion: str) -> List[str]:
     try:
-        print("All conditions met. Triggering Glue job...")
-        glue_client.start_job_run(JobName=glue_job,Arguments={'--reportregionname': reportregion, '--identifier': 'SPDST'})  # Override the existing --env parameter
-        d = datetime.utcnow()
-        
         rds_cursor.execute(
-            """UPDATE audit.sc360_reportrefreshtrigger_log 
-            SET Actual_Start_time = %s, execution_status = %s, error_message = %s 
-            WHERE batchrundate = %s 
-            AND regionname = %s 
-            AND report_source = %s;""",
-            (d, 'Submitted', 'NA', batch_run_date+timedelta(days=1), reportregion, 'SPDST')
+            "SELECT filename FROM audit.fileproperty_check_new WHERE priorityflag = 'YES' AND region = %s AND data_source LIKE %s;",
+            (reportregion, "BMT%"),
         )
-        rds_connection.commit()
-        print("Glue job started")
-    except Exception as e:
-        print(f"Error triggering Glue job: {e}")
+        return [row[0] for row in rds_cursor.fetchall()]
+    except Exception:
+        logger.exception("fetch_priority_files failed")
         raise
 
-def handle_cutoff_time_reached(rds_cursor, rds_connection, reportregion, batch_run_date, filesnotreceived, filesfailed, env, sns_client, sns_arn, current_time, join_start):
-    """
-    Handle cutoff time reached with missing files.
 
-    Args:
-        rds_cursor: RDS database cursor.
-        rds_connection: RDS database connection.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        filesnotreceived (list): List of files not received.
-        filesfailed (list): List of failed files.
-        env (str): Deployment environment.
-        sns_client: Boto3 SNS client.
-        sns_arn (str): SNS topic ARN.
-        current_time (datetime): Current time.
-        join_start (datetime): Expected start time.
-    """
+def fetch_loaded_curated_files(
+    rds_cursor,
+    reportregion: str,
+    batch_run_date: date,
+    log_batch_run_date: Optional[date],
+    priorityfiles: Sequence[str],
+) -> List[str]:
     try:
-        print("Cutoff time reached, handling missing files alert...")
+        if not priorityfiles:
+            return []
+        placeholders = ", ".join(["%s"] * len(priorityfiles))
+        base_query = (
+            "SELECT DISTINCT filename FROM audit.sc360_audit_log "
+            "WHERE batchrundate = %s AND regionname = %s AND processname = %s AND executionstatus = %s"
+        )
+        params: List[Any] = [batch_run_date, reportregion, "RedshiftCuratedLoad", "Succeeded"]
 
-        error_msg = f"Cut off time Reached: Missing {len(filesnotreceived)} files"
-        
+        if log_batch_run_date is not None:
+            base_query += " AND to_date(to_char(logtimestamp, 'YYYY-MM-DD'), 'YYYY-MM-DD') = %s"
+            params.append(log_batch_run_date)
+
+        base_query += f" AND filename IN ({placeholders});"
+        params.extend(list(priorityfiles))
+        rds_cursor.execute(base_query, params)
+        return [r[0] for r in rds_cursor.fetchall()]
+    except Exception:
+        logger.exception("fetch_loaded_curated_files failed")
+        raise
+
+
+def map_loaded_files_to_procs(rds_cursor, reportregion: str, loadedcuratedfiles: Sequence[str]) -> List[Tuple[str, str]]:
+    try:
+        procs: List[Tuple[str, str]] = []
+        for lf in loadedcuratedfiles:
+            rds_cursor.execute(
+                "SELECT DISTINCT stored_procedure_name FROM audit.sps_batch_master_table_updated WHERE regionname=%s AND source_filename LIKE %s LIMIT 1;",
+                (reportregion, f"%{lf}%"),
+            )
+            row = rds_cursor.fetchone()
+            if row:
+                procs.append((lf, row[0]))
+        return procs
+    except Exception:
+        logger.exception("map_loaded_files_to_procs failed")
+        raise
+
+
+def verify_published_layer_completion(
+    rds_cursor,
+    reportregion: str,
+    batch_run_date: date,
+    log_batch_run_date: Optional[date],
+    procs_list: Sequence[Tuple[str, str]],
+) -> List[str]:
+    try:
+        final_files: List[str] = []
+        for loadedfile, spname in procs_list:
+            query = (
+                "SELECT COUNT(*) FROM audit.sc360_audit_log "
+                "WHERE batchrundate = %s AND regionname = %s AND processname = %s AND executionstatus = %s"
+            )
+            params: List[Any] = [batch_run_date, reportregion, "RedshiftPublishedLoad", "Succeeded"]
+            if log_batch_run_date is not None:
+                query += " AND to_date(to_char(logtimestamp, 'YYYY-MM-DD'), 'YYYY-MM-DD') = %s"
+                params.append(log_batch_run_date)
+            query += " AND scriptpath = %s;"
+            params.append(spname)
+            rds_cursor.execute(query, params)
+            cnt = int(rds_cursor.fetchone()[0] or 0)
+            if cnt > 0:
+                final_files.append(loadedfile)
+        return final_files
+    except Exception:
+        logger.exception("verify_published_layer_completion failed")
+        raise
+
+
+def handle_priority_files_and_counts(
+    rds_cursor,
+    s3_client,
+    env: str,
+    reportregion: str,
+    batch_run_date: date,
+    priorityfiles: Sequence[str],
+    final_files: Sequence[str],
+) -> Tuple[List[str], List[Dict[str, List[str]]], int, str]:
+    try:
+        files_not_received: List[str] = []
+        files_failed: List[Dict[str, List[str]]] = []
+        pfcount = 0
+        em = ""
+
+        if not priorityfiles:
+            return files_not_received, files_failed, pfcount, em
+
+        landing_bucket = f"sc360-{env}-{reportregion.lower()}-bucket"
+        landing_prefix = f"LandingZone/dt={batch_run_date}/"
+        archive_prefix = f"ArchiveZone/dt={batch_run_date}/"
+
+        landing_files = set(list_s3_files(s3_client, landing_bucket, landing_prefix))
+        archived_files = set(list_s3_files(s3_client, landing_bucket, archive_prefix))
+
+        for pfile in priorityfiles:
+            if pfile in final_files:
+                pfcount += 1
+                continue
+
+            rds_cursor.execute(
+                "SELECT COUNT(*) FROM audit.sc360_audit_log WHERE filename=%s AND processname='DataValidation' AND errormessage LIKE %s AND batchrundate=%s AND sourcename LIKE %s;",
+                (pfile, "%list index out of rangeException caught while converting the SCITS file to relational in scits_data_conversion_to_relational function.%", batch_run_date, "%.dat"),
+            )
+            src_cnt = int(rds_cursor.fetchone()[0] or 0)
+            if src_cnt > 0:
+                pfcount += 1
+                continue
+
+            file_received_flag = any(pfile in f for f in landing_files) or any(pfile in f for f in archived_files)
+
+            rds_cursor.execute(
+                "SELECT DISTINCT processname FROM audit.sc360_audit_log WHERE batchrundate=%s AND executionstatus='Failed' AND filename=%s;",
+                (batch_run_date, pfile),
+            )
+            failed_procs = [r[0] for r in rds_cursor.fetchall()]
+            if failed_procs:
+                files_failed.append({pfile: failed_procs})
+                em = str(pfile)
+            else:
+                if not file_received_flag:
+                    files_not_received.append(pfile)
+                    em = ", ".join(files_not_received)
+                else:
+                    logger.info("%s received but not finished loading yet", pfile)
+
+        return files_not_received, files_failed, pfcount, em
+    except Exception:
+        logger.exception("handle_priority_files_and_counts failed")
+        raise
+
+
+# -----------------------
+# Actions: trigger, pending, cutoff
+# -----------------------
+def trigger_glue_job(
+    glue_client,
+    sns_client,
+    sns_arn: str,
+    env: str,
+    glue_job: str,
+    reportregion: str,
+    rds_cursor,
+    rds_conn,
+    batch_run_date: date,
+    priority_checked: Optional[bool] = None,
+    current_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    try:
+        if current_time is None:
+            current_time = datetime.utcnow()
+
+        publish_sns(
+            sns_client,
+            sns_arn,
+            f"*** {reportregion} BMT report refresh is started ***",
+            {"Env": env, "Message": f"The BMT {reportregion} Report refresh is started. Open glue job log : {glue_job}", "Region": reportregion},
+        )
+
+        args = {"--reportregionname": reportregion, "--identifier": "BMT"}
+        if priority_checked is not None:
+            args["--priority_File_recieved"] = "Y" if priority_checked else "N"
+        resp = glue_client.start_job_run(JobName=glue_job, Arguments=args)
+        jobrunid = resp.get("JobRunId")
+        logger.info("Started glue job %s for %s (JobRunId=%s)", glue_job, reportregion, jobrunid)
+
+        rds_cursor.execute(
+            "UPDATE audit.sc360_reportrefreshtrigger_log SET Actual_Start_time=%s, execution_status=%s, error_message=%s WHERE batchrundate=%s AND regionname=%s AND report_source='BMT';",
+            (current_time, "Submitted", "NULL", batch_run_date, reportregion),
+        )
+        rds_conn.commit()
+        logger.info("Audit updated to Submitted for %s batch %s", reportregion, batch_run_date)
+        return resp
+    except Exception:
+        logger.exception("trigger_glue_job failed")
+        raise
+
+
+def update_pending_status_bmt(rds_cursor, rds_conn, reportregion: str, batch_run_date: date, em: str) -> None:
+    try:
+        msg = f"PF Missing {em or ''}"
+        rds_cursor.execute(
+            "UPDATE audit.sc360_reportrefreshtrigger_log SET execution_status=%s, error_message=%s WHERE batchrundate=%s AND regionname=%s AND report_source='BMT';",
+            ("Delay", msg, batch_run_date, reportregion),
+        )
+        rds_conn.commit()
+        logger.info("Audit updated to Delay for %s batch %s (msg=%s)", reportregion, batch_run_date, msg)
+    except Exception:
+        logger.exception("update_pending_status_bmt failed")
+        raise
+
+
+def handle_cutoff_updates_and_notifications(
+    rds_cursor,
+    rds_conn,
+    reportregion: str,
+    batch_run_date: date,
+    files_not_received: Sequence[str],
+    files_failed: Sequence[Dict[str, List[str]]],
+    env: str,
+    sns_client,
+    sns_arn: str,
+    current_time: datetime,
+    join_start: datetime,
+    em: str,
+) -> None:
+    try:
+        msg = f"Cut off time Reached and priority files not received {em or ''}"
         if current_time > join_start:
             rds_cursor.execute(
-                """UPDATE audit.sc360_reportrefreshtrigger_log 
-                SET error_message = %s, execution_status = %s 
-                WHERE batchrundate = %s 
-                AND regionname = %s 
-                AND report_source = %s;""",
-                (error_msg, 'Delay', batch_run_date+timedelta(days=1), reportregion, 'SPDST')
+                "UPDATE audit.sc360_reportrefreshtrigger_log SET error_message=%s, execution_status=%s WHERE batchrundate=%s AND regionname=%s AND report_source='BMT';",
+                (msg, "Delay", batch_run_date, reportregion),
             )
-            rds_connection.commit()
-
-        # Send appropriate alerts
-        if filesnotreceived:
-            send_sns_message(sns_client, sns_arn, f"** {reportregion} SPDST Priority Files Missing**", {"Env": env, "File": filesnotreceived, "Process Name": "Files Not Received", "Region": reportregion})
-
-        if filesfailed:
-            send_sns_message(sns_client, sns_arn, f"** {reportregion} SPDST Priority File Failure**", {"Env": env, "File": filesfailed, "Process Name": "NA", "Region": reportregion})
-    except Exception as e:
-        print(f"Error handling cutoff time reached: {e}")
-        raise
-
-def update_pending_status(rds_cursor, rds_connection, reportregion, batch_run_date, filesnotreceived):
-    """
-    Update status for pending files.
-
-    Args:
-        rds_cursor: RDS database cursor.
-        rds_connection: RDS database connection.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        filesnotreceived (list): List of files not received.
-    """
-    try:
-
-        error_msg = f"Pending files: {len(filesnotreceived)}"
-        rds_cursor.execute(
-            """UPDATE audit.sc360_reportrefreshtrigger_log 
-            SET execution_status = %s, error_message = %s 
-            WHERE batchrundate = %s 
-            AND regionname = %s 
-            AND report_source = %s;""",
-            ('Delay', error_msg, batch_run_date+timedelta(days=1), reportregion, 'SPDST')
-        )
-        rds_connection.commit()
-    except Exception as e:
-        print(f"Error updating pending status: {e}")
-        raise
-
-def handle_delay_notifications(current_time, delay_cutoff_strt_hour, delay_cutoff_strt_min, delay_cutoff_end_hour, delay_cutoff_end_min, env, reportregion, sns_client, sns_arn):
-    """
-    Handle delay notifications.
-
-    Args:
-        current_time (datetime): Current time.
-        delay_cutoff_strt_hour (int): Delay cutoff start hour.
-        delay_cutoff_strt_min (int): Delay cutoff start minute.
-        delay_cutoff_end_hour (int): Delay cutoff end hour.
-        delay_cutoff_end_min (int): Delay cutoff end minute.
-        env (str): Deployment environment.
-        reportregion (str): Report region name.
-        sns_client: Boto3 SNS client.
-        sns_arn (str): SNS topic ARN.
-    """
-    try:
-        print("Handling delay notifications...")
-        delay_snstimeperiod = 'YES' if (
-            (current_time.hour > delay_cutoff_strt_hour or 
-             (current_time.hour == delay_cutoff_strt_hour and current_time.minute >= delay_cutoff_strt_min)) and 
-            (current_time.hour < delay_cutoff_end_hour or 
-             (current_time.hour == delay_cutoff_end_hour and current_time.minute <= delay_cutoff_end_min))
-        ) else 'NO'
-
-        if delay_snstimeperiod == 'YES':
-            sns_message = {
-                "Env": env,
-                "Report_Source": 'SPDST',
-                "Region": reportregion,
-                "Message": 'Potential delay in SPDST report generation'
-            }
-            sns_subject = f"*** Delay in {reportregion} SPDST Report Refresh ***"
-            response = sns_client.publish(
-                TargetArn=sns_arn, 
-                Message=json.dumps(sns_message), 
-                Subject=sns_subject
+            rds_conn.commit()
+        if files_not_received:
+            publish_sns(
+                sns_client,
+                sns_arn,
+                f"*** {reportregion} BMT Priority File Missing ***",
+                {"Env": env, "Missing Priority File": list(files_not_received), "Process Name failed, If any": "Files Not Received", "Region": reportregion},
             )
-            print(f"SNS Message Published Successfully! Message ID: {response['MessageId']}, {sns_subject}")
-    except Exception as e:
-        print(f"Error handling delay notifications: {e}")
+        if files_failed:
+            publish_sns(
+                sns_client,
+                sns_arn,
+                f"*** {reportregion} BMT Priority File Failure ***",
+                {"Env": env, "Priority File Failed": list(files_failed), "Process Name failed, If any": "NA", "Region": reportregion},
+            )
+    except Exception:
+        logger.exception("handle_cutoff_updates_and_notifications failed")
         raise
 
-def create_initial_log_entry(rds_cursor, rds_connection, batch_run_date, reportregion, glue_job, join_start, join_end):
-    """
-    Create initial log entry for execution.
 
-    Args:
-        rds_cursor: RDS database cursor.
-        rds_connection: RDS database connection.
-        batch_run_date (datetime.date): Batch run date.
-        reportregion (str): Report region name.
-        glue_job (str): Glue job name.
-        join_start (datetime): Expected start time.
-        join_end (datetime): Expected end time.
-    """
+def create_initial_log_entry(rds_cursor, rds_conn, batch_run_date: date, reportregion: str, glue_job: str, join_start: datetime, join_end: datetime) -> None:
     try:
-        execution_status = 'Yet to start'
-        error_message = 'SPDST report refresh pending initialization'
-        
         rds_cursor.execute(
-            """INSERT INTO audit.sc360_reportrefreshtrigger_log (
-                batchrundate, regionname, execution_status, 
-                gluejob, report_source, Expected_Start_time, 
-                Expected_End_time, error_message
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""",
-            (batch_run_date+ timedelta(days=1), reportregion, execution_status, glue_job, 'SPDST', join_start, join_end, error_message)
+            "INSERT INTO audit.sc360_reportrefreshtrigger_log (batchrundate, regionname, execution_status, gluejob, report_source, Expected_Start_time, Expected_End_time, error_message) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
+            (batch_run_date, reportregion, "Yet to start", glue_job, "BMT", join_start, join_end, "BMT report refresh yet to start"),
         )
-        rds_connection.commit()
-        print("Initial log entry created")
-    except Exception as e:
-        print(f"Error creating initial log entry: {e}")
+        rds_conn.commit()
+        logger.info("Inserted initial trigger_log for %s batch %s", reportregion, batch_run_date)
+    except Exception:
+        logger.exception("create_initial_log_entry failed")
         raise
 
-def check_priority_apj_sfdc_check(rds_cursor, reportregion, batch_run_date, current_time, env, sns_client, sns_arn):
-    """
-    Check if APJ OPEN SFDC file is loaded to published and handle accordingly.
 
-    Args:
-        rds_cursor: RDS database cursor.
-        reportregion (str): Report region name.
-        batch_run_date (datetime.date): Batch run date.
-        current_time (datetime): Current time.
-        env (str): Deployment environment.
-        sns_client: Boto3 SNS client.
-        sns_arn (str): SNS topic ARN.
-    """
+def handle_delay_notifications(
+    current_time: datetime,
+    delay_start_hour: int,
+    delay_start_min: int,
+    delay_end_hour: int,
+    delay_end_min: int,
+    env: str,
+    reportregion: str,
+    sns_client,
+    sns_arn: str,
+) -> None:
     try:
-        # Check if the current time is within the specified range for APJ OPEN SFDC check (3:05 to 3:30 UTC)
-        if int(current_time.hour) == 3 and 5 < int(current_time.minute) < 30:
-            rds_cursor.execute("""SELECT COUNT(*) FROM audit.sc360_audit_log 
-                                  WHERE filename='APJ_OPEN_SFDC' 
-                                  AND processname='RedshiftPublishedLoad' 
-                                  AND batchrundate=%s 
-                                  AND executionstatus='Succeeded';""", 
-                                (batch_run_date,))
-            sfdc_check = rds_cursor.fetchone()[0]
-            if sfdc_check > 0:
-                return
+        today = current_time.date()
+        start = datetime.combine(today, dt_time(hour=delay_start_hour, minute=delay_start_min, second=0))
+        end = datetime.combine(today, dt_time(hour=delay_end_hour, minute=delay_end_min, second=59))
 
-            s3_client = boto3.client('s3')
-            landing_bucket = f'sc360-{env}-{reportregion.lower()}-bucket'
-            landing_folder = f'LandingZone/dt={batch_run_date + timedelta(days=1)}/'
-            archive_folder = f'ArchiveZone/dt={batch_run_date + timedelta(days=1)}/'
-            landing_files = check_s3_files(s3_client, landing_bucket, landing_folder)
-            archive_files = check_s3_files(s3_client, landing_bucket, archive_folder)
+        logger.info(
+            "Evaluating delay notification window for region=%s env=%s: current_time=%s window_start=%s window_end=%s",
+            reportregion,
+            env,
+            current_time,
+            start,
+            end,
+        )
 
-            if 'APJ_OPEN_SFDC' in landing_files or 'APJ_OPEN_SFDC' in archive_files:
-                return
-
-            rds_cursor.execute("""SELECT DISTINCT processname 
-                                  FROM audit.sc360_audit_log 
-                                  WHERE filename='APJ_OPEN_SFDC' 
-                                  AND batchrundate=%s 
-                                  AND executionstatus='Failed';""", 
-                                (batch_run_date,))
-            failed_processes = rds_cursor.fetchall()
-            if failed_processes:
-                print('Sending sns for APJ open sfdc failed file')
-                send_sns_message(sns_client, sns_arn, '*** APJ Priority File Failure ***', 
-                                 {"Env": env, "Priority File Failed": ['APJ_OPEN_SFDC Failed'], "Process Name failed, If any": failed_processes, "Region": reportregion})
-            else:
-                print('Sending sns for APJ open sfdc missing file')
-                send_sns_message(sns_client, sns_arn, '*** APJ SPDST Priority File Missing ***', 
-                                 {"Env": env, "Missing Priority File": ['APJ_OPEN_SFDC'], "Process Name failed, If any": 'NA', "Region": reportregion})
+        if start <= current_time <= end:
+            logger.info("Current time is inside delay window — sending delay SNS for region=%s", reportregion)
+            publish_sns(
+                sns_client,
+                sns_arn,
+                f"*** Delay in {reportregion} BMT Report Refresh ***",
+                {"Env": env, "Report_Source": "BMT", "Region": reportregion, "Message": "Potential delay in BMT report refresh"},
+            )
+            logger.info("Delay SNS published for region=%s", reportregion)
         else:
-            print('Outside APJ Open SFDC sns time range')
-    except Exception as e:
-        print(f"Error in check_priority_apj_sfdc_check: {e}")
+            logger.info("Current time is outside delay window — no delay notification for region=%s", reportregion)
+    except Exception:
+        logger.exception("handle_delay_notifications failed")
         raise
 
-def lambda_handler(event, context):
-    """
-    Main Lambda handler for SPDST Report Refresh orchestration.
 
-    Workflow:
-    1. Initialize connections and environment variables
-    2. Check current execution status in audit tables
-    3. Validate prerequisite conditions:
-        - Dependent Glue jobs status
-        - Priority file availability
-        - BMT report completion
-    4. Trigger report generation Glue job when ready
-    5. Handle alerts and status updates based on cutoff times
-    6. Maintain audit log for monitoring and troubleshooting
+# -----------------------
+# Lambda handler
+# -----------------------
+def lambda_handler(event: Dict[str, Any], context: Any) -> None:
+    region = _aws_region()
+    sns_client = boto3.client("sns", region_name=region)
+    glue_client = boto3.client("glue", region_name=region)
+    s3_client = boto3.client("s3", region_name=region)
 
-    Args:
-        event (dict): Lambda event payload.
-        context (dict): Lambda context object.
+    env = os.environ.get("env")
+    reportregion = os.environ.get("reportregion")
+    sns_arn = os.environ.get("sns_arn")
+    redshift_secret_name = os.environ.get("redshift_secret_name")
+    rds_secret_name = os.environ.get("rds_secret_name")
+    glue_job = os.environ.get("glue_job")
+    extraHour = int(os.environ.get("extraHour", "0"))
+    extraMin = int(os.environ.get("extraMin", "0"))
+    cutoff_strt_hour = int(os.environ.get("cutoff_strt_hour", "0"))
+    cutoff_strt_min = int(os.environ.get("cutoff_strt_minute", "0"))
+    cutoff_end_hour = int(os.environ.get("cutoff_end_hour", "23"))
+    cutoff_end_min = int(os.environ.get("cutoff_end_minute", "59"))
+    delay_cutoff_strt_hour = int(os.environ.get("delay_cutoff_strt_hour", "0"))
+    delay_cutoff_strt_min = int(os.environ.get("delay_cutoff_strt_minute", "0"))
+    delay_cutoff_end_hour = int(os.environ.get("delay_cutoff_end_hour", "23"))
+    delay_cutoff_end_min = int(os.environ.get("delay_cutoff_end_minute", "59"))
 
-    Returns:
-        None
-    """
+    dependent_job1 = os.environ.get("dependent_job1", "")
+
+    current_time = datetime.utcnow()
+
+    rds_conn = redshift_conn = None
     try:
-        # Initialize environment variables and AWS clients
-        current_time = datetime.utcnow()
-        reportregion = os.environ['reportregion']
-        env = os.environ['env']
-        glue_job = os.environ['glue_job']
-        sns_arn = os.environ['sns_arn']
-        delay_sns_arn = os.environ['delay_sns_arn']
-        
-        glue_client = boto3.client('glue')
-        s3_client = boto3.client('s3')
-        sns_client = boto3.client('sns')
+        redshift_conn = get_db_connection(redshift_secret_name, region_name=region)
+        rds_conn = get_db_connection(rds_secret_name, region_name=region)
 
-        # Establish database connections
-        redshift_connection = get_db_connection(os.environ['redshift_secret_name'])
-        rds_connection = get_db_connection(os.environ['rds_secret_name'])
-        redshift_cursor = redshift_connection.cursor()
-        rds_cursor = rds_connection.cursor()
+        with redshift_conn.cursor() as redshift_cursor, rds_conn.cursor() as rds_cursor:
+            logger.info("Starting BMT APJ orchestration for region=%s env=%s", reportregion, env)
 
-        # Print environment and region information
-        print(f"Starting Lambda function for environment: {env}, region: {reportregion}")
+            join_start, join_end, default_batch_run_date = compute_join_start_end_for_bmt(rds_cursor, reportregion)
 
-        # Determine batch run date
-        batch_run_date = date.today() - timedelta(days=1)
+            (
+                rundate,
+                refreshlogdate,
+                batch_run_date,
+                E_count,
+                logtimestamp,
+                lastrefreshactualtime,
+                logBatchrundt,
+                Batchrundt,
+            ) = determine_rundates(rds_cursor, reportregion, current_time, default_batch_run_date)
 
-        # Check if APJ OPEN SFDC file is loaded to published
-        check_priority_apj_sfdc_check(rds_cursor, reportregion, batch_run_date, current_time, env, sns_client, sns_arn)
+            logger.info(
+                "determine_rundates returned rundate=%s refreshlogdate=%s batch_run_date=%s E_count=%s logtimestamp=%s lastrefreshactualtime=%s logBatchrundt=%s Batchrundt=%s",
+                rundate,
+                refreshlogdate,
+                batch_run_date,
+                E_count,
+                logtimestamp,
+                lastrefreshactualtime,
+                logBatchrundt,
+                Batchrundt,
+            )
 
-        # Fetch execution time window
-        join_start, join_end = fetch_execution_time_window(rds_cursor, reportregion)
-        
-        # Check existing execution status
-        execution_exists, execution_status = check_existing_execution_status(rds_cursor, reportregion, batch_run_date+ timedelta(days=1))
-        
-        if execution_exists:
-            # Handle duplicate execution scenarios
-            if handle_duplicate_execution(glue_client, rds_cursor, rds_connection, reportregion, batch_run_date+ timedelta(days=1), execution_status, current_time, join_start):
-                print("Duplicate execution found and handled. Exiting Lambda.")
+            should_exit, legacy_reason = handle_legacy_refreshlogdate_flow(
+                rds_cursor,
+                rds_conn,
+                reportregion,
+                refreshlogdate,
+                E_count,
+                logtimestamp,
+                lastrefreshactualtime,
+                glue_job,
+                join_start,
+                join_end,
+            )
+            logger.info("Legacy refreshlogdate check result: should_exit=%s reason=%s", should_exit, legacy_reason)
+
+            if should_exit:
+                logger.info("Exiting lambda early due to legacy refreshlogdate condition: %s", legacy_reason)
                 return
 
-            # Retrieve priority files
-            priority_files = retrieve_priority_files(rds_cursor, reportregion)
-            
-            # Check loaded files in curated layer
-            loadedcuratedfiles = check_loaded_curated_files(rds_cursor, reportregion, batch_run_date, priority_files)
-            
-            # Map curated files to stored procedures
-            procs_list = map_files_to_stored_procedures(rds_cursor, reportregion, loadedcuratedfiles)
-            
-            # Verify if files have been loaded to the published layer
-            final_files = verify_published_layer_completion(rds_cursor, reportregion, batch_run_date, procs_list)
-            
-            # Handle priority files and update status
-            filesnotreceived, filesfailed, pfcount = handle_priority_files(s3_client, env, reportregion, rds_cursor, rds_connection, batch_run_date, priority_files, final_files)
+            # Use helper to select the trigger-row date (prefer refreshlogdate, fallback to batch_run_date)
+            trigger_row_date, exists, execution_status = select_trigger_row_date(rds_cursor, reportregion, refreshlogdate, batch_run_date)
+            logger.info("Trigger-log date determined: trigger_row_date=%s exists=%s execution_status=%s", trigger_row_date, exists, execution_status)
 
-            # Determine current time period status
-            snstimeperiod = determine_time_period_status(current_time, int(os.environ['cutoff_strt_hour']), int(os.environ['cutoff_strt_minute']), int(os.environ['cutoff_end_hour']), int(os.environ['cutoff_end_minute']))
-            
-            # Check BMT report completion
-            BMTFlag = check_bmt_report_completion(rds_cursor, reportregion, batch_run_date+ timedelta(days=1), rds_connection, current_time, join_start)
+            if exists:
+                if execution_status in ("Finished", "Submitted"):
+                    logger.info("Report refresh already triggered for %s", trigger_row_date)
+                    return
 
-            print(f"Processed files count:{pfcount}, priority file count:{len(priority_files)}, BMTFlag:{BMTFlag}, SNS Time period status:{snstimeperiod}, Missing Priority Files: {filesnotreceived}")
-            
-            # Main decision logic
-            if pfcount == len(priority_files) and BMTFlag == 1:
-                # All conditions met - trigger Glue job
-                trigger_glue_job(glue_client, rds_cursor, rds_connection, reportregion, batch_run_date, glue_job)
-            elif pfcount != len(priority_files) and snstimeperiod == 'YES':
-                # Handle cutoff time reached with missing files
-                handle_cutoff_time_reached(rds_cursor, rds_connection, reportregion, batch_run_date, filesnotreceived, filesfailed, env, sns_client, sns_arn, current_time, join_start)
+                update_master_data_for_irr(rds_cursor, rds_conn, reportregion)
+
+                # Pass the chosen trigger_row_date so audit updates target the proper row
+                if handle_dependent_jobs_check(glue_client, rds_cursor, rds_conn, [dependent_job1], current_time, join_start, trigger_row_date, reportregion):
+                    return
+
+                extra_cutoff_st_hr = cutoff_strt_hour + extraHour
+                extra_cutoff_st_mn = cutoff_strt_min + extraMin
+                extra_cutoff_end_hr = cutoff_end_hour + extraHour
+
+                in_forced_window = (current_time.hour > extra_cutoff_st_hr) or (current_time.hour == extra_cutoff_st_hr and current_time.minute >= extra_cutoff_st_mn)
+                in_forced_window = in_forced_window and (current_time.hour <= extra_cutoff_end_hr)
+
+                if in_forced_window:
+                    trigger_glue_job(glue_client, sns_client, sns_arn, env, glue_job, reportregion, rds_cursor, rds_conn, trigger_row_date, priority_checked=False, current_time=current_time)
+                else:
+                    priorityfiles = fetch_priority_files(rds_cursor, reportregion)
+                    loadedcuratedfiles = fetch_loaded_curated_files(rds_cursor, reportregion, batch_run_date, logBatchrundt, priorityfiles)
+                    procs_list = map_loaded_files_to_procs(rds_cursor, reportregion, loadedcuratedfiles)
+                    final_files = verify_published_layer_completion(rds_cursor, reportregion, batch_run_date, logBatchrundt, procs_list)
+                    files_not_received, files_failed, pfcount, em = handle_priority_files_and_counts(rds_cursor, s3_client, env, reportregion, batch_run_date, priorityfiles, final_files)
+
+                    in_cutoff_window = False
+                    try:
+                        today = current_time.date()
+                        cutoff_start = datetime.combine(today, dt_time(hour=cutoff_strt_hour, minute=cutoff_strt_min, second=0))
+                        cutoff_end = datetime.combine(today, dt_time(hour=cutoff_end_hour, minute=cutoff_end_min, second=59))
+                        in_cutoff_window = cutoff_start <= current_time <= cutoff_end
+                    except Exception:
+                        logger.exception("Error evaluating cutoff window")
+
+                    logger.info("pfcount=%d priority_count=%d in_cutoff=%s Missing Priority Files=%s", pfcount, len(priorityfiles), in_cutoff_window, files_not_received)
+
+                    if pfcount >= len(priorityfiles):
+                        trigger_glue_job(glue_client, sns_client, sns_arn, env, glue_job, reportregion, rds_cursor, rds_conn, trigger_row_date, priority_checked=True, current_time=current_time)
+                    elif (pfcount != len(priorityfiles)) and in_cutoff_window:
+                        handle_cutoff_updates_and_notifications(rds_cursor, rds_conn, reportregion, trigger_row_date, files_not_received, files_failed, env, sns_client, sns_arn, current_time, join_start, em)
+                    else:
+                        if current_time > join_start:
+                            update_pending_status_bmt(rds_cursor, rds_conn, reportregion, trigger_row_date, em)
+
+                handle_delay_notifications(current_time, delay_cutoff_strt_hour, delay_cutoff_strt_min, delay_cutoff_end_hour, delay_cutoff_end_min, env, reportregion, sns_client, sns_arn)
             else:
-                # Monitoring ongoing - update status
-                if current_time > join_start:
-                    update_pending_status(rds_cursor, rds_connection, reportregion, batch_run_date, filesnotreceived)
-            
-            # Handle delay notifications
-            handle_delay_notifications(current_time, int(os.environ['delay_cutoff_strt_hour']), int(os.environ['delay_cutoff_strt_minute']), int(os.environ['delay_cutoff_end_hour']), int(os.environ['delay_cutoff_end_minute']), env, reportregion, sns_client, delay_sns_arn)
-        else:
-            # Initial execution - create log entry
-            create_initial_log_entry(rds_cursor, rds_connection, batch_run_date, reportregion, glue_job, join_start, join_end)
+                # No trigger row existed; create initial row for the chosen trigger_row_date
+                create_initial_log_entry(rds_cursor, rds_conn, trigger_row_date, reportregion, glue_job, join_start, join_end)
 
-        # Cleanup and completion
-        redshift_connection.close()
-        rds_connection.close()
-        print("Lambda execution completed for", reportregion)
-    
-    except Exception as e:
-        print(f"Error in lambda_handler: {e}")
+        logger.info("BMT APJ orchestration completed for region=%s", reportregion)
+    except Exception:
+        logger.exception("Error in BMT APJ lambda handler")
         raise
+    finally:
+        try:
+            if redshift_conn:
+                redshift_conn.close()
+            if rds_conn:
+                rds_conn.close()
+        except Exception:
+            logger.exception("Error closing DB connections")
